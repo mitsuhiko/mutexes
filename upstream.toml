@@ -1,0 +1,14 @@
+# run.sh places this manifest beside the original std integration tests.
+[package]
+name = "upstream-sync-tests"
+version = "0.0.0"
+edition = "2024"
+autotests = false
+
+[[test]]
+name = "sync"
+path = "tests/sync/lib.rs"
+
+[dev-dependencies]
+rand = { version = "0.9", default-features = false, features = ["alloc"] }
+rand_xorshift = "0.4"
