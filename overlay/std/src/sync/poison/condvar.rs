@@ -1,7 +1,6 @@
 use crate::fmt;
-use crate::sync::WaitTimeoutResult;
-use crate::sync::lock::{self, Poison as _};
-use crate::sync::poison::{self, LockResult, MutexGuard};
+use crate::sync::poison::{self, LockResult, MutexGuard, PoisonError};
+use crate::sync::{WaitTimeoutResult, lock};
 use crate::time::{Duration, Instant};
 
 /// A Condition Variable
@@ -124,7 +123,8 @@ impl Condvar {
     #[rustc_should_not_be_called_on_const_items]
     pub fn wait<'a, T>(&self, mut guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
         self.inner.wait(&mut guard.inner);
-        guard.inner.poison().check(guard)
+        let poisoned = guard.inner.poison().get();
+        if poisoned { Err(PoisonError::new(guard)) } else { Ok(guard) }
     }
 
     /// Blocks the current thread until the provided condition becomes false.
@@ -322,7 +322,8 @@ impl Condvar {
         dur: Duration,
     ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
         let result = WaitTimeoutResult(self.inner.wait_timeout(&mut guard.inner, dur));
-        guard.inner.poison().check((guard, result))
+        let poisoned = guard.inner.poison().get();
+        if poisoned { Err(PoisonError::new((guard, result))) } else { Ok((guard, result)) }
     }
 
     /// Waits on this condition variable for a notification, timing out after a

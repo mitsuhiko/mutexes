@@ -10,6 +10,17 @@
 //!
 //! The public types in both modules are newtypes around these, which only
 //! translate results and errors.
+//!
+//! Both families compile to the same code as their separate implementations
+//! did. Three details keep it that way:
+//!
+//! - Acquisitions are `#[rustc_force_inline]` and take the public guard's
+//!   constructor, so a public `lock` has the same MIR as before and builds its
+//!   result in one step.
+//! - Public guards hold the shared guard in `ManuallyDrop` and release it from
+//!   their own `Drop`, so a guard still has a single destructor.
+//! - Constructors are `Copy`, so a panic during acquisition needs no cleanup
+//!   for them.
 
 mod condvar;
 mod mutex;
@@ -34,8 +45,10 @@ pub(crate) trait Poison {
 
     /// Called right after a shared acquisition.
     fn check<G>(&self, guard: G) -> Self::Result<G>;
-    /// Called right after an exclusive acquisition.
-    fn enter<G>(&self, guard: impl FnOnce(Self::Guard) -> G) -> Self::Result<G>;
+    /// Called right after an exclusive acquisition. `guard` builds the guard;
+    /// constructors are `Copy` throughout so that no cleanup is needed for them
+    /// if acquiring unwinds (a landing pad changes codegen on some targets).
+    fn enter<G>(&self, guard: impl FnOnce(Self::Guard) -> G + Copy) -> Self::Result<G>;
     /// Called right before an exclusive release.
     fn leave(&self, guard: &Self::Guard);
 
@@ -58,7 +71,7 @@ impl Poison for () {
         guard
     }
     #[inline(always)]
-    fn enter<G>(&self, guard: impl FnOnce(()) -> G) -> G {
+    fn enter<G>(&self, guard: impl FnOnce(()) -> G + Copy) -> G {
         guard(())
     }
     #[inline(always)]
@@ -69,13 +82,14 @@ impl Poison for () {
     unsafe fn leave_ptr(_: (), _: &()) {}
 }
 
-// Public guards implement `Drop` as part of their API, so they cannot be
-// destructured. Move the shared guard out without running that (empty) `Drop`.
+// A public guard holds its shared guard in `ManuallyDrop` and releases it from
+// its own `Drop`, so dropping it is one destructor, as before, not two nested
+// ones. Take the shared guard back out, armed, without running that `Drop`.
 macro_rules! into_inner {
     ($guard:expr) => {{
-        let guard = crate::mem::ManuallyDrop::new($guard);
-        // SAFETY: the input has been consumed, and its destructor is suppressed.
-        unsafe { crate::ptr::read(&guard.inner) }
+        let mut guard = crate::mem::ManuallyDrop::new($guard);
+        // SAFETY: the public guard is consumed and its destructor suppressed.
+        unsafe { crate::mem::ManuallyDrop::take(&mut guard.inner) }
     }};
 }
 pub(crate) use into_inner;

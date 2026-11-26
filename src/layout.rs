@@ -7,7 +7,7 @@ use std::sync::{self as p, nonpoison as n};
 
 #[repr(align(64))]
 #[allow(dead_code)]
-struct CacheLine([u8; 64]);
+pub struct CacheLine([u8; 64]);
 
 /// A payload that is `UnwindSafe` but neither `RefUnwindSafe` nor `Sync`.
 type C = Cell<u32>;
@@ -59,7 +59,7 @@ macro_rules! table {
         /// A static too, so that cross-compiled assembly contains the table.
         #[unsafe(no_mangle)]
         #[used]
-        pub static LAYOUT: [Entry; 2 * [$(stringify!($t)),+].len()] = [$(
+        pub static PROBE_LAYOUT: [Entry; 2 * [$(stringify!($t)),+].len()] = [$(
             entry!(p::$t $(<$($arg),+>)?),
             entry!(n::$t $(<$($arg),+>)?),
         )+];

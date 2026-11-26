@@ -44,10 +44,10 @@ impl<P, T> Mutex<P, T> {
 /// Acquisitions take the public guard's constructor, so that both families
 /// build their guard in one step: `G` for nonpoison, `LockResult<G>` for poison.
 impl<P: Poison, T: ?Sized> Mutex<P, T> {
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn lock<'a, G>(
         &'a self,
-        wrap: impl FnOnce(MutexGuard<'a, P, T>) -> G,
+        wrap: impl FnOnce(MutexGuard<'a, P, T>) -> G + Copy,
     ) -> P::Result<G> {
         unsafe {
             self.inner.lock();
@@ -55,10 +55,10 @@ impl<P: Poison, T: ?Sized> Mutex<P, T> {
         }
     }
 
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn try_lock<'a, G>(
         &'a self,
-        wrap: impl FnOnce(MutexGuard<'a, P, T>) -> G,
+        wrap: impl FnOnce(MutexGuard<'a, P, T>) -> G + Copy,
     ) -> Option<P::Result<G>> {
         unsafe { if self.inner.try_lock() { Some(MutexGuard::new(self, wrap)) } else { None } }
     }
@@ -79,8 +79,8 @@ impl<P, T: ?Sized> Mutex<P, T> {
 impl<'a, P: Poison, T: ?Sized> MutexGuard<'a, P, T> {
     /// # Safety
     /// The mutex must be locked by the current thread.
-    #[inline(always)]
-    unsafe fn new<G>(lock: &'a Mutex<P, T>, wrap: impl FnOnce(Self) -> G) -> P::Result<G> {
+    #[rustc_force_inline]
+    unsafe fn new<G>(lock: &'a Mutex<P, T>, wrap: impl FnOnce(Self) -> G + Copy) -> P::Result<G> {
         lock.poison.enter(|poison| wrap(MutexGuard { lock, poison }))
     }
 
@@ -156,6 +156,18 @@ impl<P: Poison, T: ?Sized> DerefMut for MutexGuard<'_, P, T> {
 impl<P: Poison, T: ?Sized> Drop for MutexGuard<'_, P, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this is the release.
+        unsafe { self.release() }
+    }
+}
+
+impl<P: Poison, T: ?Sized> MutexGuard<'_, P, T> {
+    /// Unlocks. Public guards call this from their own `Drop`.
+    ///
+    /// # Safety
+    /// Call once, and neither use nor drop the guard afterwards.
+    #[inline(always)]
+    pub(crate) unsafe fn release(&mut self) {
         unsafe {
             self.lock.poison.leave(&self.poison);
             self.lock.inner.unlock();
@@ -231,6 +243,18 @@ impl<P: Poison, T: ?Sized> DerefMut for MappedMutexGuard<'_, P, T> {
 impl<P: Poison, T: ?Sized> Drop for MappedMutexGuard<'_, P, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this is the release.
+        unsafe { self.release() }
+    }
+}
+
+impl<P: Poison, T: ?Sized> MappedMutexGuard<'_, P, T> {
+    /// Unlocks. Public guards call this from their own `Drop`.
+    ///
+    /// # Safety
+    /// Call once, and neither use nor drop the guard afterwards.
+    #[inline(always)]
+    pub(crate) unsafe fn release(&mut self) {
         unsafe {
             P::leave_ptr(self.poison_flag, &self.poison);
             self.inner.unlock();

@@ -57,6 +57,8 @@
 //!
 //! [`Once`]: crate::sync::Once
 
+#[unstable(feature = "poison_cell", issue = "none")]
+pub use self::cell::{Poison, PoisonGuard};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::condvar::Condvar;
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
@@ -76,6 +78,7 @@ use crate::sync::lock;
 #[cfg(panic = "unwind")]
 use crate::thread;
 
+mod cell;
 mod condvar;
 #[stable(feature = "rust1", since = "1.0.0")]
 mod mutex;
@@ -402,7 +405,7 @@ impl lock::Poison for Flag {
     }
 
     #[inline]
-    fn enter<G>(&self, guard: impl FnOnce(Guard) -> G) -> LockResult<G> {
+    fn enter<G>(&self, guard: impl FnOnce(Guard) -> G + Copy) -> LockResult<G> {
         map_result(self.guard(), guard)
     }
 

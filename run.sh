@@ -35,6 +35,7 @@ if [[ ${1:-} == upstream ]]; then
   [[ -L $harness/tests ]] || ln -s "$lib/std/tests" "$harness/tests"
   set -- test --release --manifest-path "$harness/Cargo.toml" --test sync -- "$@"
 elif [[ $# -eq 0 ]]; then
-  set -- test --tests
+  # tests/poison_cell.rs needs the shared std.
+  if [[ $mode == shared ]]; then set -- test --tests; else set -- test --test contract; fi
 fi
 cargo -Zbuild-std "$@"

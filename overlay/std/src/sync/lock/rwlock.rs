@@ -75,10 +75,10 @@ impl<P, T: ?Sized> RwLock<P, T> {
 /// Acquisitions take the public guard's constructor, so that both families
 /// build their guard in one step: `G` for nonpoison, `LockResult<G>` for poison.
 impl<P: Poison, T: ?Sized> RwLock<P, T> {
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn read<'a, G>(
         &'a self,
-        wrap: impl FnOnce(RwLockReadGuard<'a, T>) -> G,
+        wrap: impl FnOnce(RwLockReadGuard<'a, T>) -> G + Copy,
     ) -> P::Result<G> {
         unsafe {
             self.inner.read();
@@ -86,10 +86,10 @@ impl<P: Poison, T: ?Sized> RwLock<P, T> {
         }
     }
 
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn try_read<'a, G>(
         &'a self,
-        wrap: impl FnOnce(RwLockReadGuard<'a, T>) -> G,
+        wrap: impl FnOnce(RwLockReadGuard<'a, T>) -> G + Copy,
     ) -> Option<P::Result<G>> {
         unsafe {
             if self.inner.try_read() {
@@ -100,10 +100,10 @@ impl<P: Poison, T: ?Sized> RwLock<P, T> {
         }
     }
 
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn write<'a, G>(
         &'a self,
-        wrap: impl FnOnce(RwLockWriteGuard<'a, P, T>) -> G,
+        wrap: impl FnOnce(RwLockWriteGuard<'a, P, T>) -> G + Copy,
     ) -> P::Result<G> {
         unsafe {
             self.inner.write();
@@ -111,10 +111,10 @@ impl<P: Poison, T: ?Sized> RwLock<P, T> {
         }
     }
 
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn try_write<'a, G>(
         &'a self,
-        wrap: impl FnOnce(RwLockWriteGuard<'a, P, T>) -> G,
+        wrap: impl FnOnce(RwLockWriteGuard<'a, P, T>) -> G + Copy,
     ) -> Option<P::Result<G>> {
         unsafe {
             if self.inner.try_write() { Some(RwLockWriteGuard::new(self, wrap)) } else { None }
@@ -173,16 +173,19 @@ impl<'rwlock, T: ?Sized> RwLockReadGuard<'rwlock, T> {
 impl<'rwlock, P: Poison, T: ?Sized> RwLockWriteGuard<'rwlock, P, T> {
     /// # Safety
     /// The lock must be write-locked by the current thread.
-    #[inline(always)]
-    unsafe fn new<G>(lock: &'rwlock RwLock<P, T>, wrap: impl FnOnce(Self) -> G) -> P::Result<G> {
+    #[rustc_force_inline]
+    unsafe fn new<G>(
+        lock: &'rwlock RwLock<P, T>,
+        wrap: impl FnOnce(Self) -> G + Copy,
+    ) -> P::Result<G> {
         lock.poison.enter(|poison| wrap(RwLockWriteGuard { lock, poison }))
     }
 
     /// Downgrading is not a release: it does not poison.
-    #[inline(always)]
+    #[rustc_force_inline]
     pub(crate) fn downgrade<G>(
         s: Self,
-        wrap: impl FnOnce(RwLockReadGuard<'rwlock, T>) -> G,
+        wrap: impl FnOnce(RwLockReadGuard<'rwlock, T>) -> G + Copy,
     ) -> P::Result<G> {
         let lock = s.lock;
 
@@ -343,6 +346,18 @@ impl<'rwlock, P: Poison, T: ?Sized> MappedRwLockWriteGuard<'rwlock, P, T> {
 impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this is the release.
+        unsafe { self.release() }
+    }
+}
+
+impl<T: ?Sized> RwLockReadGuard<'_, T> {
+    /// Unlocks. Public guards call this from their own `Drop`.
+    ///
+    /// # Safety
+    /// Call once, and neither use nor drop the guard afterwards.
+    #[inline(always)]
+    pub(crate) unsafe fn release(&mut self) {
         // SAFETY: the conditions of `RwLockReadGuard::new` were satisfied when created.
         unsafe {
             self.inner_lock.read_unlock();
@@ -353,6 +368,18 @@ impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
 impl<P: Poison, T: ?Sized> Drop for RwLockWriteGuard<'_, P, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this is the release.
+        unsafe { self.release() }
+    }
+}
+
+impl<P: Poison, T: ?Sized> RwLockWriteGuard<'_, P, T> {
+    /// Unlocks. Public guards call this from their own `Drop`.
+    ///
+    /// # Safety
+    /// Call once, and neither use nor drop the guard afterwards.
+    #[inline(always)]
+    pub(crate) unsafe fn release(&mut self) {
         // SAFETY: the conditions of `RwLockWriteGuard::new` were satisfied when created.
         unsafe {
             self.lock.poison.leave(&self.poison);
@@ -364,6 +391,18 @@ impl<P: Poison, T: ?Sized> Drop for RwLockWriteGuard<'_, P, T> {
 impl<T: ?Sized> Drop for MappedRwLockReadGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this is the release.
+        unsafe { self.release() }
+    }
+}
+
+impl<T: ?Sized> MappedRwLockReadGuard<'_, T> {
+    /// Unlocks. Public guards call this from their own `Drop`.
+    ///
+    /// # Safety
+    /// Call once, and neither use nor drop the guard afterwards.
+    #[inline(always)]
+    pub(crate) unsafe fn release(&mut self) {
         // SAFETY: the conditions of `RwLockReadGuard::new` were satisfied when the original guard
         // was created, and have been upheld throughout `map` and/or `filter_map`.
         unsafe {
@@ -375,6 +414,18 @@ impl<T: ?Sized> Drop for MappedRwLockReadGuard<'_, T> {
 impl<P: Poison, T: ?Sized> Drop for MappedRwLockWriteGuard<'_, P, T> {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: this is the release.
+        unsafe { self.release() }
+    }
+}
+
+impl<P: Poison, T: ?Sized> MappedRwLockWriteGuard<'_, P, T> {
+    /// Unlocks. Public guards call this from their own `Drop`.
+    ///
+    /// # Safety
+    /// Call once, and neither use nor drop the guard afterwards.
+    #[inline(always)]
+    pub(crate) unsafe fn release(&mut self) {
         // SAFETY: the conditions of `RwLockWriteGuard::new` were satisfied when the original guard
         // was created, and have been upheld throughout `map` and/or `filter_map`.
         unsafe {

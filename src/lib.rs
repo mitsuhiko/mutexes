@@ -1,4 +1,5 @@
 //! Codegen probes for both families, and the layout table. compare.sh diffs both.
+#![cfg_attr(poison_cell, feature(poison_cell, sync_poison_mod))]
 #![feature(
     nonpoison_mutex,
     nonpoison_rwlock,
@@ -9,6 +10,8 @@
 use std::sync::{self as p, nonpoison as np};
 use std::time::Duration;
 
+#[cfg(poison_cell)]
+pub mod composition;
 pub mod layout;
 
 #[unsafe(no_mangle)]

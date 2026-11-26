@@ -32,11 +32,25 @@ fn main() {
     let nm = np::Mutex::new(0u32);
     let pr = p::RwLock::new(0u32);
     let nr = np::RwLock::new(0u32);
-    time("poison Mutex lock", || (0..N).for_each(|_| *black_box(&pm).lock().unwrap() += 1));
-    time("nonpoison Mutex lock", || (0..N).for_each(|_| *black_box(&nm).lock() += 1));
-    time("poison RwLock write", || (0..N).for_each(|_| *black_box(&pr).write().unwrap() += 1));
-    time("nonpoison RwLock write", || (0..N).for_each(|_| *black_box(&nr).write() += 1));
-    time("poison RwLock read", || (0..N).for_each(|_| _ = black_box(*black_box(&pr).read().unwrap())));
-    time("poison Mutex 4 threads", || contended(|| *pm.lock().unwrap() += 1));
-    time("nonpoison Mutex 4 threads", || contended(|| *nm.lock() += 1));
+    time("poison Mutex lock", || {
+        (0..N).for_each(|_| *black_box(&pm).lock().unwrap() += 1)
+    });
+    time("nonpoison Mutex lock", || {
+        (0..N).for_each(|_| *black_box(&nm).lock() += 1)
+    });
+    time("poison RwLock write", || {
+        (0..N).for_each(|_| *black_box(&pr).write().unwrap() += 1)
+    });
+    time("nonpoison RwLock write", || {
+        (0..N).for_each(|_| *black_box(&nr).write() += 1)
+    });
+    time("poison RwLock read", || {
+        (0..N).for_each(|_| _ = black_box(*black_box(&pr).read().unwrap()))
+    });
+    time("poison Mutex 4 threads", || {
+        contended(|| *pm.lock().unwrap() += 1)
+    });
+    time("nonpoison Mutex 4 threads", || {
+        contended(|| *nm.lock() += 1)
+    });
 }
