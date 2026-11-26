@@ -11,7 +11,27 @@ struct MutexGuard<'a, P: Poison, T: ?Sized> { lock: &'a Mutex<P, T>, poison: P::
 ```
 
 `nonpoison` uses `P = ()` and `poison` uses `P = Flag`. Each public type is a
-newtype that only translates results.
+newtype that only translates results. The policy is this trait:
+
+```rust
+trait Poison {
+    type Result<G>;      // `G` for (), `LockResult<G>` for Flag
+    type Guard: Clone;   // snapshot taken at acquisition: (), or "was panicking"
+    type Ptr: Copy;      // mapped guards' way back: (), or NonNull<Flag>
+
+    fn check<G>(&self, guard: G) -> Self::Result<G>;                          // shared acquire
+    fn enter<G>(&self, guard: impl FnOnce(Self::Guard) -> G + Copy) -> Self::Result<G>; // exclusive acquire
+    fn leave(&self, guard: &Self::Guard);                                     // exclusive release
+    fn ptr(&self) -> Self::Ptr;
+    unsafe fn leave_ptr(ptr: Self::Ptr, guard: &Self::Guard);                 // release, mapped guard
+}
+```
+
+For `()` every method is a trivial `#[inline(always)]` body that stores and
+checks nothing. For `Flag`,
+`enter` is `map_result(self.guard(), guard)`, `check` is
+`map_result(self.borrow(), |()| guard)` and `leave` is `self.done(guard)`,
+which is the stock poisoning code unchanged.
 
 - **Flat field, not a wrapper.** `Poison<plain::Mutex<T>>` and
   `plain::Mutex<Poison<T>>` both put the flag inside a nested struct. Rust never
@@ -19,11 +39,8 @@ newtype that only translates results.
   Linux, `Mutex<Vec<u8>>` goes from 32 to 40 bytes. A sibling field gives
   exactly the stock field list, so the compiler produces the stock layout. The
   guard reaches the flag through the lock pointer it already holds.
-- **A policy trait with fixed hooks.** `enter` runs after exclusive acquisition,
-  `check` after shared acquisition, and `leave` before release. For `()` they
-  are empty inline functions. For `Flag` they are the existing `guard`, `borrow`
-  and `done`. The shared code calls the hooks and nothing more, so it never has
-  to ask which family it is.
+- **Fixed hooks.** The shared code calls the hooks and nothing more, so it
+  never has to ask which family it is.
 - **The result type belongs to the policy.** `P::Result<G>` is `G` for `()` and
   `LockResult<G>` for `Flag`. The shared `lock` returns it directly, so neither
   family converts a result it doesn't need.
