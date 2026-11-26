@@ -1,6 +1,6 @@
-use super::{Held, Poison};
 use crate::ops::{Deref, DerefMut};
-use crate::sync::{LockResult, PoisonError, TryLockError, TryLockResult, nonpoison as plain};
+use crate::sync::lock::{self, into_inner};
+use crate::sync::{LockResult, PoisonError, TryLockError, TryLockResult, poison};
 use crate::{fmt, mem};
 
 /// A reader-writer lock
@@ -88,7 +88,7 @@ use crate::{fmt, mem};
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "RwLock")]
 pub struct RwLock<#[rustc_assert_variance(invariant)] T: ?Sized> {
-    inner: Poison<plain::RwLock<T>>,
+    inner: lock::RwLock<poison::Flag, T>,
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -120,7 +120,7 @@ pub struct RwLockReadGuard<
     #[rustc_assert_variance(covariant)] 'rwlock,
     #[rustc_assert_variance(covariant)] T: ?Sized + 'rwlock,
 > {
-    inner: plain::RwLockReadGuard<'rwlock, T>,
+    inner: lock::RwLockReadGuard<'rwlock, T>,
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -148,7 +148,7 @@ pub struct RwLockWriteGuard<
     #[rustc_assert_variance(covariant)] 'rwlock,
     #[rustc_assert_variance(invariant)] T: ?Sized + 'rwlock,
 > {
-    inner: Held<'rwlock, plain::RwLockWriteGuard<'rwlock, T>>,
+    inner: lock::RwLockWriteGuard<'rwlock, poison::Flag, T>,
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -157,11 +157,11 @@ impl<T: ?Sized> !Send for RwLockWriteGuard<'_, T> {}
 #[stable(feature = "rwlock_guard_sync", since = "1.23.0")]
 unsafe impl<T: ?Sized + Sync> Sync for RwLockWriteGuard<'_, T> {}
 
-// Previously derived from the reference to the poisoning lock. The wrapped
-// plain guard does not itself promise unwind safety.
+// These used to follow from `&RwLock<T>` being unwind safe; the guard now refers
+// to the shared lock, which (like the nonpoison one) is not.
 #[stable(feature = "catch_unwind", since = "1.9.0")]
 impl<T: ?Sized> crate::panic::UnwindSafe for RwLockWriteGuard<'_, T> {}
-#[stable(feature = "unwind_safe_lock_refs", since = "1.12.0")]
+#[stable(feature = "catch_unwind", since = "1.9.0")]
 impl<T: ?Sized> crate::panic::RefUnwindSafe for RwLockWriteGuard<'_, T> {}
 
 /// RAII structure used to release the shared read access of a lock when
@@ -182,7 +182,7 @@ pub struct MappedRwLockReadGuard<
     #[rustc_assert_variance(covariant)] 'rwlock,
     #[rustc_assert_variance(covariant)] T: ?Sized + 'rwlock,
 > {
-    inner: plain::MappedRwLockReadGuard<'rwlock, T>,
+    inner: lock::MappedRwLockReadGuard<'rwlock, T>,
 }
 
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
@@ -209,7 +209,7 @@ pub struct MappedRwLockWriteGuard<
     #[rustc_assert_variance(covariant)] 'rwlock,
     #[rustc_assert_variance(invariant)] T: ?Sized + 'rwlock,
 > {
-    inner: Held<'rwlock, plain::MappedRwLockWriteGuard<'rwlock, T>>,
+    inner: lock::MappedRwLockWriteGuard<'rwlock, poison::Flag, T>,
 }
 
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
@@ -236,7 +236,7 @@ impl<T> RwLock<T> {
     #[rustc_const_stable(feature = "const_locks", since = "1.63.0")]
     #[inline]
     pub const fn new(t: T) -> RwLock<T> {
-        Self { inner: Poison::new(plain::RwLock::new(t)) }
+        RwLock { inner: lock::RwLock::new(poison::Flag::new(), t) }
     }
 
     /// Returns the contained value by cloning it.
@@ -386,8 +386,7 @@ impl<T: ?Sized> RwLock<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
-        let guard = self.inner.lock.read();
-        self.inner.flag.check(RwLockReadGuard { inner: guard })
+        self.inner.read(|inner| RwLockReadGuard { inner })
     }
 
     /// Attempts to acquire this `RwLock` with shared read access.
@@ -431,8 +430,10 @@ impl<T: ?Sized> RwLock<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
-        let guard = self.inner.lock.try_read().map_err(|_| TryLockError::WouldBlock)?;
-        self.inner.flag.check(RwLockReadGuard { inner: guard }).map_err(Into::into)
+        match self.inner.try_read(|inner| RwLockReadGuard { inner }) {
+            Some(result) => Ok(result?),
+            None => Err(TryLockError::WouldBlock),
+        }
     }
 
     /// Locks this `RwLock` with exclusive write access, blocking the current
@@ -472,8 +473,7 @@ impl<T: ?Sized> RwLock<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
-        let guard = self.inner.lock.write();
-        self.inner.flag.hold(guard, |inner| RwLockWriteGuard { inner })
+        self.inner.write(|inner| RwLockWriteGuard { inner })
     }
 
     /// Attempts to lock this `RwLock` with exclusive write access.
@@ -518,8 +518,10 @@ impl<T: ?Sized> RwLock<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
-        let guard = self.inner.lock.try_write().map_err(|_| TryLockError::WouldBlock)?;
-        self.inner.flag.hold(guard, |inner| RwLockWriteGuard { inner }).map_err(Into::into)
+        match self.inner.try_write(|inner| RwLockWriteGuard { inner }) {
+            Some(result) => Ok(result?),
+            None => Err(TryLockError::WouldBlock),
+        }
     }
 
     /// Determines whether the lock is poisoned.
@@ -546,7 +548,7 @@ impl<T: ?Sized> RwLock<T> {
     #[inline]
     #[stable(feature = "sync_poison", since = "1.2.0")]
     pub fn is_poisoned(&self) -> bool {
-        self.inner.flag.get()
+        self.inner.poison.get()
     }
 
     /// Clear the poisoned state from a lock.
@@ -583,7 +585,7 @@ impl<T: ?Sized> RwLock<T> {
     #[inline]
     #[stable(feature = "mutex_unpoison", since = "1.77.0")]
     pub fn clear_poison(&self) {
-        self.inner.flag.clear();
+        self.inner.poison.clear();
     }
 
     /// Consumes this `RwLock`, returning the underlying data.
@@ -612,7 +614,8 @@ impl<T: ?Sized> RwLock<T> {
     where
         T: Sized,
     {
-        self.inner.flag.check(self.inner.lock.into_inner())
+        let poison = self.inner.poison.borrow();
+        poison::map_result(poison, |()| self.inner.into_inner())
     }
 
     /// Returns a mutable reference to the underlying data.
@@ -641,7 +644,8 @@ impl<T: ?Sized> RwLock<T> {
     /// ```
     #[stable(feature = "rwlock_get_mut", since = "1.6.0")]
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
-        self.inner.flag.check(self.inner.lock.get_mut())
+        let poison = self.inner.poison.borrow();
+        poison::map_result(poison, |()| self.inner.get_mut())
     }
 
     /// Returns a raw pointer to the underlying data.
@@ -652,7 +656,7 @@ impl<T: ?Sized> RwLock<T> {
     /// or written through after the lock is dropped.
     #[unstable(feature = "rwlock_data_ptr", issue = "140368")]
     pub const fn data_ptr(&self) -> *mut T {
-        self.inner.lock.data_ptr()
+        self.inner.data_ptr()
     }
 }
 
@@ -671,7 +675,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
                 d.field("data", &format_args!("<locked>"));
             }
         }
-        d.field("poisoned", &self.inner.flag.get());
+        d.field("poisoned", &self.inner.poison.get());
         d.finish_non_exhaustive()
     }
 }
@@ -714,8 +718,7 @@ impl<'rwlock, T: ?Sized> RwLockReadGuard<'rwlock, T> {
         F: FnOnce(&T) -> &U,
         U: ?Sized,
     {
-        let inner = plain::RwLockReadGuard::map(into_guard_inner!(orig), f);
-        MappedRwLockReadGuard { inner }
+        MappedRwLockReadGuard { inner: lock::RwLockReadGuard::map(into_inner!(orig), f) }
     }
 
     /// Makes a [`MappedRwLockReadGuard`] for a component of the borrowed data. The
@@ -739,8 +742,10 @@ impl<'rwlock, T: ?Sized> RwLockReadGuard<'rwlock, T> {
         F: FnOnce(&T) -> Option<&U>,
         U: ?Sized,
     {
-        let inner = plain::RwLockReadGuard::filter_map(into_guard_inner!(orig), f);
-        inner.map(|inner| MappedRwLockReadGuard { inner }).map_err(|inner| Self { inner })
+        match lock::RwLockReadGuard::filter_map(into_inner!(orig), f) {
+            Ok(inner) => Ok(MappedRwLockReadGuard { inner }),
+            Err(inner) => Err(RwLockReadGuard { inner }),
+        }
     }
 }
 
@@ -805,8 +810,9 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
     /// ```
     #[stable(feature = "rwlock_downgrade", since = "1.92.0")]
     pub fn downgrade(s: Self) -> RwLockReadGuard<'rwlock, T> {
-        let guard = into_guard_inner!(s).downgrade();
-        RwLockReadGuard { inner: plain::RwLockWriteGuard::downgrade(guard) }
+        let inner = into_inner!(s);
+        lock::RwLockWriteGuard::downgrade(inner, |inner| RwLockReadGuard { inner })
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Makes a [`MappedRwLockWriteGuard`] for a component of the borrowed data, e.g.
@@ -828,10 +834,7 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
         F: FnOnce(&mut T) -> &mut U,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::RwLockWriteGuard::map(guard, |v| watch.project(|| f(v)))
-        });
-        MappedRwLockWriteGuard { inner }
+        MappedRwLockWriteGuard { inner: lock::RwLockWriteGuard::map(into_inner!(orig), f) }
     }
 
     /// Makes a [`MappedRwLockWriteGuard`] for a component of the borrowed data. The
@@ -854,13 +857,10 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
         F: FnOnce(&mut T) -> Option<&mut U>,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::RwLockWriteGuard::filter_map(guard, |v| watch.project(|| f(v)))
-        });
-        inner
-            .transpose()
-            .map(|inner| MappedRwLockWriteGuard { inner })
-            .map_err(|inner| Self { inner })
+        match lock::RwLockWriteGuard::filter_map(into_inner!(orig), f) {
+            Ok(inner) => Ok(MappedRwLockWriteGuard { inner }),
+            Err(inner) => Err(RwLockWriteGuard { inner }),
+        }
     }
 }
 
@@ -885,8 +885,7 @@ impl<'rwlock, T: ?Sized> MappedRwLockReadGuard<'rwlock, T> {
         F: FnOnce(&T) -> &U,
         U: ?Sized,
     {
-        let inner = plain::MappedRwLockReadGuard::map(into_guard_inner!(orig), f);
-        MappedRwLockReadGuard { inner }
+        MappedRwLockReadGuard { inner: lock::MappedRwLockReadGuard::map(into_inner!(orig), f) }
     }
 
     /// Makes a [`MappedRwLockReadGuard`] for a component of the borrowed data.
@@ -910,8 +909,10 @@ impl<'rwlock, T: ?Sized> MappedRwLockReadGuard<'rwlock, T> {
         F: FnOnce(&T) -> Option<&U>,
         U: ?Sized,
     {
-        let inner = plain::MappedRwLockReadGuard::filter_map(into_guard_inner!(orig), f);
-        inner.map(|inner| MappedRwLockReadGuard { inner }).map_err(|inner| Self { inner })
+        match lock::MappedRwLockReadGuard::filter_map(into_inner!(orig), f) {
+            Ok(inner) => Ok(MappedRwLockReadGuard { inner }),
+            Err(inner) => Err(MappedRwLockReadGuard { inner }),
+        }
     }
 }
 
@@ -935,10 +936,7 @@ impl<'rwlock, T: ?Sized> MappedRwLockWriteGuard<'rwlock, T> {
         F: FnOnce(&mut T) -> &mut U,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::MappedRwLockWriteGuard::map(guard, |v| watch.project(|| f(v)))
-        });
-        MappedRwLockWriteGuard { inner }
+        MappedRwLockWriteGuard { inner: lock::MappedRwLockWriteGuard::map(into_inner!(orig), f) }
     }
 
     /// Makes a [`MappedRwLockWriteGuard`] for a component of the borrowed data.
@@ -961,13 +959,10 @@ impl<'rwlock, T: ?Sized> MappedRwLockWriteGuard<'rwlock, T> {
         F: FnOnce(&mut T) -> Option<&mut U>,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::MappedRwLockWriteGuard::filter_map(guard, |v| watch.project(|| f(v)))
-        });
-        inner
-            .transpose()
-            .map(|inner| MappedRwLockWriteGuard { inner })
-            .map_err(|inner| Self { inner })
+        match lock::MappedRwLockWriteGuard::filter_map(into_inner!(orig), f) {
+            Ok(inner) => Ok(MappedRwLockWriteGuard { inner }),
+            Err(inner) => Err(MappedRwLockWriteGuard { inner }),
+        }
     }
 }
 
@@ -1005,14 +1000,14 @@ impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.inner.guard
+        &self.inner
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner.guard
+        &mut self.inner
     }
 }
 
@@ -1030,14 +1025,14 @@ impl<T: ?Sized> Deref for MappedRwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.inner.guard
+        &self.inner
     }
 }
 
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
 impl<T: ?Sized> DerefMut for MappedRwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner.guard
+        &mut self.inner
     }
 }
 

@@ -1,129 +1,137 @@
-# Can std's two lock families share their implementation?
+# One lock implementation for `std::sync::poison` and `std::sync::nonpoison`
 
-**Yes. Make nonpoison the implementation, and poison the client.** This is a
-working libstd overlay for [rust-lang/rust#134645](https://github.com/rust-lang/rust/issues/134645),
-not a model lock or a benchmark of `lock().unwrap_or_else(...)`. No changes to
-the nonpoison types or platform backends. Both public sets of types, signatures,
-docs and stability gates remain separate.
+A libstd overlay for [rust-lang/rust#134645](https://github.com/rust-lang/rust/issues/134645).
+`Mutex`, `RwLock` and `Condvar` are implemented once, in a private module
+[`sync::lock`](overlay/std/src/sync/lock.rs). Both public families are thin
+newtypes over it. Compared to stock std:
 
-## Regressions compared to stock `std::sync::Mutex`
+- **Same layout and auto traits.** Every lock and guard keeps its size,
+  alignment and auto traits in both families, including over-aligned payloads (`Mutex<u32>` is
+  still 16 bytes, `Mutex<CacheLine>` still 128, a poisoning `MutexGuard`
+  still 16).
+- **No cost for nonpoison.** The nonpoison probes compile to byte-identical
+  assembly.
+- **Same cost for poison.** 20 of the 24 probes are byte-identical. The other
+  4 are 4–6 instructions *shorter*, with the same atomics and calls.
+- Public types, signatures, docs and stability attributes are unchanged.
 
-On arm64 macOS (nightly-2026-10-21, release, `panic=unwind`), both
-**`Mutex<u32>` and `MutexGuard<'_, u32>` grow from 16 to 24 bytes (+50%)**.
-The flag itself did not grow: the stock mutex can fit it into padding that the
-wrapper cannot reuse. The stock guard can find the flag through its mutex
-pointer; the wrapper guard needs a second pointer.
+## How
 
-The lock-size change depends on the payload: `Mutex<u64>` stays at 24 bytes,
-while a mutex around a 64-byte, 64-aligned payload grows from 128 to 192 bytes.
-These are **space regressions**. We did not benchmark poisoning-path latency or
-throughput; the [identical assembly results](#cost) apply only to nonpoison.
-
-## Implementation
-
-Start with [wrapper.rs](overlay/std/src/sync/poison/wrapper.rs), then
-[`Mutex::lock`](overlay/std/src/sync/poison/mutex.rs). The field is literally:
+The shared lock carries a poison policy `P` as an ordinary field, between the
+system lock and the data:
 
 ```rust
-inner: Poison<plain::Mutex<T>>,
+pub(crate) struct Mutex<P, T: ?Sized> {
+    inner: sys::Mutex,
+    poison: P,          // `()` for nonpoison, `poison::Flag` for poison
+    data: UnsafeCell<T>,
+}
 ```
 
-`Poison<L>` is a flag and an ordinary lock. After acquiring that lock, the
-poisoning facade attaches a panic-at-entry snapshot to the returned guard.
-The watcher is declared **before** the plain guard, so Rust drops it first:
-another thread cannot acquire an unlocked-but-not-yet-marked mutex. The
-poisoned error owns the live guard, just as it does today.
+`nonpoison::Mutex<T>` wraps `lock::Mutex<(), T>` and `poison::Mutex<T>` wraps
+`lock::Mutex<Flag, T>`. Those are the stock layouts field for field, so rustc
+lays them out the same way: the flag still fits into padding next to the
+system lock. Exclusive guards are `{ &lock, P::Guard }`, so a poisoning guard
+reaches its flag through the lock pointer it already holds.
 
-Why not `plain::Mutex<Poison<T>>`? `is_poisoned` and `clear_poison` must work
-without locking, including while the caller already owns the mutex. A flag
-inside the payload would need special projections to access it independently
-of an exclusive payload borrow. Putting the flag outside avoids that aliasing
-problem and requires no new interface from plain locks.
+The [`Poison`](overlay/std/src/sync/lock.rs) trait hooks the policy in at
+fixed points: `enter` after an exclusive acquisition, `check` after a shared
+one, `leave` before an exclusive release. For `()` every hook is an inlined
+no-op and stores nothing. For `Flag` they are the stock `Flag::guard`, `borrow`
+and `done`. Acquisition results are an associated
+type, `P::Result<G>`: `G` for `()`, `LockResult<G>` for `Flag`. The shared
+lock takes the public guard's constructor, so the poisoning `lock` builds
+its result in a single `map_result`, just as stock does. Both families call it
+the same way:
 
-## What gets shared
+```rust
+pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {  // nonpoison: MutexGuard<'_, T>
+    self.inner.lock(|inner| MutexGuard { inner })
+}
+```
 
-- **Mutex and RwLock:** acquisition, try-acquisition, storage, dereferencing,
-  unlocking, all guard projections/remaps, and atomic write-to-read downgrade
-  go through the existing nonpoison implementations. A read guard checks old
-  poison on acquisition but carries no watcher.
-- **Condvar:** the poisoning condvar contains a plain condvar. It lends it the
-  inner mutex guard and checks the flag *after reacquisition*. The poisoning
-  predicate loops stay separate: they must return the poisoned guard (and
-  timeout result) before calling user code again.
-- **What stays public-side:** result/error translation, value accessors with
-  different error ownership, formatting, nominal types and their trait impls.
-  Source-line savings are smaller than the implementation sharing: the public
-  APIs and docs still have two spellings. The patch is +231 / −418 lines. All
-  39 unsafe blocks in the three poisoning primitive files disappear; one
-  private field-move helper remains in `poison.rs` to preserve *explicit*
-  public `Drop` impls. No macro generates lock algorithms.
+The public files keep their docs, result and error translation, and
+`is_poisoned`/`clear_poison`. Locking, guards, mapping, downgrading and
+unlocking exist once. The poisoning condvar checks the flag after waking. Its
+predicate loops stay separate, because they have to return a poisoned guard
+before calling the predicate again.
 
-The subtle case is mapping an exclusive guard. The plain mapper owns the guard
-while it calls user code. Marking poison in its *caller* on unwind would be too
-late: the plain mapper would already have unlocked. `Watch::project` instead
-moves the watcher **into the projection closure**. If it panics, poison is
-published there. If it succeeds (including a filter miss), the returned guard
-inherits the original snapshot. Mapping is not another acquisition.
+Details that matter:
 
-## Cost
+- Mapped guards store `P::Ptr` (`()` or `NonNull<Flag>`). A lifetime-carrying
+  associated type would make `'a` invariant, but the public mapped guards are
+  covariant in `'a`.
+- Mapping keeps the panic snapshot taken at acquisition. If the map closure
+  panics, the shared guard is still the owner, so its drop poisons before
+  unlocking.
+- `downgrade` does not poison. It still reports and discards existing poison,
+  like stock.
+- Public guards keep their explicit `Drop` impls. Moving the shared guard out
+  of one (for `map`, `downgrade`) is the one `ptr::read` in
+  [`into_inner!`](overlay/std/src/sync/lock.rs).
+- The shared types only have auto-derived traits. An explicit `UnwindSafe`
+  impl for `lock::Mutex<Flag, T>` would switch off the auto impl for
+  `lock::Mutex<(), T>` too, and change nonpoison. The two poisoning exclusive
+  guards used to inherit unwind safety from `&Mutex<T>`/`&RwLock<T>`, so they
+  now state it explicitly (rustdoc lists these impls under trait
+  implementations instead of auto traits).
 
-There is no “poisoning disabled” runtime path: a nonpoison lock has no
-`Poison`, flag, watcher, extra pointer, panic query or policy branch. As a check,
-we rebuilt **stock and modified std with the same compiler** and compared the
-*entire assembly output* of [11 nonpoison probes](src/lib.rs). Byte-identical
-on **aarch64-apple-darwin** (pthread mutex) and **x86_64-unknown-linux-gnu**
-(futex mutex). Only source directory names were remapped, before compilation;
-no instructions were stripped. Linux was cross-compiled, not executed.
+The patch is +953 / −709 lines, most of it the ~800-line shared module. The
+duplicated logic is gone, but both public APIs and their docs remain.
 
-Selected sizes in bytes on aarch64 macOS, release, unwinding enabled:
+## Why not `Poison<plain::Mutex<T>>` or `plain::Mutex<Poison<T>>`
 
-| Type | Nonpoison (both) | Poison stock | Poison wrapper |
-|---|---:|---:|---:|
-| `Mutex<u32>` | 16 | 16 | 24 |
-| `Mutex<u64>` | 16 | 24 | 24 |
-| `Mutex<CacheLine>` (64-byte payload and alignment) | 128 | 128 | 192 |
-| `MutexGuard<u32>` | 8 | 16 | 24 |
-| `MappedMutexGuard<u32>` | 16 | 32 | 32 |
-| `RwLock<u32>` | 16 | 16 | 24 |
-| `RwLockReadGuard<u32>` | 16 | 16 | 16 |
-| `RwLockWriteGuard<u32>` | 8 | 16 | 24 |
-| `Condvar` | 16 | 16 | 16 |
+Both nest the flag inside a struct, and a nested struct's padding can't be
+reused. Outside the lock, `Mutex<u32>` grows from 16 to 24 bytes and the guard
+needs a second pointer. Inside the payload, `Poison<CacheLine>` is already 128
+bytes and the mutex becomes 192. Only a flat field matches stock for every `T`.
 
-**Recommendation:** this is a readable way to share lock behavior with zero
-added nonpoison cost. It is **not** a layout-neutral replacement for the
-existing poisoning types. The outer flag cannot occupy padding inside a nested
-lock; an ordinary exclusive guard now carries a separate pointer to that flag.
-If the poisoning regressions are unacceptable, the next design to test is a
-private flat `{ raw, header, data }` lock with header `()` or `Flag`, so the
-poisoning guard can refer to the whole lock again. That's a different trade:
-more intrusion into the plain implementation for better poisoning layout.
-Nothing here establishes free *selectable-at-lock-time* poisoning, or measures
-poison-path throughput.
+## Evidence
+
+Measured on arm64 macOS (pthread) and x86_64 Linux (futex, cross-compiled
+only), nightly-2026-10-21, release, `panic=unwind`. Stock and modified std
+are built with the same compiler. [`compare.sh`](compare.sh) diffs the whole
+assembly output of the [probes](src/lib.rs) function by function:
+
+| | identical functions | differing functions |
+|---|---|---|
+| aarch64 | 101 of 105 | `p_lock_inc`, `p_lock_recover`, `p_map`, `p_write`: 4–6 fewer instructions |
+| x86_64 | 32 of 41 | the same 4 probes (5 fewer each), plus 5 cold `PoisonError` drop/unwrap paths with equal counts |
+
+All differences are in poisoning code, and all have the same atomics and calls
+as stock. Stock sinks the flag address into both branches of the `panicking()`
+check and needs an extra callee-saved register on the hot path; the shared
+version computes it once. The [layout table](src/layout.rs) (size, alignment,
+`Send`, `Sync`, `UnwindSafe`, `RefUnwindSafe` and `Unpin` of 42 types) is
+compiled into the probes as a static and is byte-identical on both targets.
+On arm64, uncontended `lock`/`write`/`read` throughput
+([`examples/bench.rs`](examples/bench.rs)) is the same within noise: about
+5.7 ns/op for both families on both builds.
+
+Tests: the 8 [contract tests](tests/contract.rs) and the original
+`std/tests/sync` suite (339 pass, 1 ignored) pass. std builds without new
+warnings, with `panic=abort` too.
+
+Not covered: debugger visualizers (they read the old field paths) and
+platforms other than the two above.
 
 ## Reproduce
 
-Baseline: Rust [19833af72](https://github.com/rust-lang/rust/commit/19833af7224424e8b53e288097d56b6af43d5bcf),
-nightly-2026-10-21. Requires rustup, rust-src, bash, rsync and a host linker.
-Cargo may fetch dependencies on first use. If `nightly` already points at that
-commit with rust-src installed, no setup is needed. Otherwise:
+Requires rustup, nightly-2026-10-21 with `rust-src`, rsync and python3.
+`run.sh` copies rust-src under `target/{stock,shared}/sysroot`, applies the
+[overlay](overlay/) to the shared copy, and builds with `-Zbuild-std`. It
+never touches the toolchain.
 
 ```sh
 export TOOLCHAIN=nightly-2026-10-21
 rustup toolchain install "$TOOLCHAIN" --component rust-src
-```
 
-```sh
-./run.sh shared test --release --test contract   # 8 targeted tests; also pass in stock mode
-./run.sh shared upstream                         # original std/tests/sync: 339 pass, 1 ignored
-./compare.sh                                     # native assembly + size/alignment diff
-TARGET=x86_64-unknown-linux-gnu ./compare.sh      # cross-target assembly only
+./run.sh shared test --release --test contract   # also passes in stock mode
+./run.sh shared upstream                         # std/tests/sync
+./compare.sh                                     # layouts + native assembly
+TARGET=x86_64-unknown-linux-gnu ./compare.sh      # the same, cross-compiled
+./run.sh shared run --release --example layout    # print the layout table
+./run.sh stock run --release --example bench      # then: shared
 CARGO_PROFILE_RELEASE_PANIC=abort ./run.sh shared build --release --lib
-./patch.sh > std.patch                            # review/apply against pinned rust-lang/rust
+./patch.sh > std.patch                            # against rust-lang/rust 19833af72
 ```
-
-`run.sh` copies rust-src under `target/{stock,shared}/sysroot` and uses
-`cargo -Zbuild-std`. It never edits rustup or a Rust checkout. Use the script,
-not bare `cargo test`, to test the modified implementation. The refactor is
-only the five files under [overlay/](overlay/); everything else is the harness.
-This is a feasibility experiment, not a full bootstrap, debugger-visualizer or
-all-platform compatibility audit.

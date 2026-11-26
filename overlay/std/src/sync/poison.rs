@@ -69,24 +69,12 @@ pub use self::rwlock::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
 pub use self::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::error::Error;
 use crate::fmt;
+use crate::ptr::NonNull;
 #[cfg(panic = "unwind")]
 use crate::sync::atomic::{Atomic, AtomicBool, Ordering};
+use crate::sync::lock;
 #[cfg(panic = "unwind")]
 use crate::thread;
-
-// Public guards implement Drop as part of their API. Each is now a
-// single owning field with an empty destructor. Move that field out
-// when transferring ownership instead of dropping the guard.
-macro_rules! into_guard_inner {
-    ($guard:expr) => {{
-        let guard = crate::mem::ManuallyDrop::new($guard);
-        // SAFETY: the input has been consumed, and its destructor is suppressed.
-        unsafe { crate::ptr::read(&guard.inner) }
-    }};
-}
-
-mod wrapper;
-use wrapper::{Held, Poison};
 
 mod condvar;
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -398,5 +386,39 @@ where
         Ok(t) => Ok(f(t)),
         #[cfg(panic = "unwind")]
         Err(PoisonError { data }) => Err(PoisonError::new(f(data))),
+    }
+}
+
+/// The poisoning policy of the shared lock implementation: report poison on
+/// every acquisition; poison if the thread started panicking while holding it.
+impl lock::Poison for Flag {
+    type Result<G> = LockResult<G>;
+    type Guard = Guard;
+    type Ptr = NonNull<Flag>;
+
+    #[inline]
+    fn check<G>(&self, guard: G) -> LockResult<G> {
+        map_result(self.borrow(), |()| guard)
+    }
+
+    #[inline]
+    fn enter<G>(&self, guard: impl FnOnce(Guard) -> G) -> LockResult<G> {
+        map_result(self.guard(), guard)
+    }
+
+    #[inline]
+    fn leave(&self, guard: &Guard) {
+        self.done(guard)
+    }
+
+    #[inline(always)]
+    fn ptr(&self) -> NonNull<Flag> {
+        NonNull::from(self)
+    }
+
+    #[inline]
+    unsafe fn leave_ptr(flag: NonNull<Flag>, guard: &Guard) {
+        // SAFETY: the caller guarantees that the flag is still alive.
+        unsafe { flag.as_ref() }.done(guard)
     }
 }

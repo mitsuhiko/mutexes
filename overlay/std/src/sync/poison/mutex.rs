@@ -1,6 +1,6 @@
-use super::{Held, Poison};
 use crate::ops::{Deref, DerefMut};
-use crate::sync::{LockResult, PoisonError, TryLockError, TryLockResult, nonpoison as plain};
+use crate::sync::lock::{self, into_inner};
+use crate::sync::{LockResult, PoisonError, TryLockError, TryLockResult, poison};
 use crate::{fmt, mem};
 
 /// A mutual exclusion primitive useful for protecting shared data
@@ -221,7 +221,7 @@ use crate::{fmt, mem};
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "Mutex")]
 pub struct Mutex<#[rustc_assert_variance(invariant)] T: ?Sized> {
-    inner: Poison<plain::Mutex<T>>,
+    inner: lock::Mutex<poison::Flag, T>,
 }
 
 /// `T` must be `Send` for a [`Mutex`] to be `Send` because it is possible to acquire
@@ -272,7 +272,7 @@ pub struct MutexGuard<
     #[rustc_assert_variance(covariant)] 'a,
     #[rustc_assert_variance(invariant)] T: ?Sized + 'a,
 > {
-    pub(super) inner: Held<'a, plain::MutexGuard<'a, T>>,
+    pub(super) inner: lock::MutexGuard<'a, poison::Flag, T>,
 }
 
 /// A [`MutexGuard`] is not `Send` to maximize platform portability.
@@ -289,11 +289,11 @@ impl<T: ?Sized> !Send for MutexGuard<'_, T> {}
 #[stable(feature = "mutexguard", since = "1.19.0")]
 unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
-// Previously derived from the reference to the poisoning lock. The wrapped
-// plain guard does not itself promise unwind safety.
+// These used to follow from `&Mutex<T>` being unwind safe; the guard now refers
+// to the shared lock, which (like the nonpoison one) is not.
 #[stable(feature = "catch_unwind", since = "1.9.0")]
 impl<T: ?Sized> crate::panic::UnwindSafe for MutexGuard<'_, T> {}
-#[stable(feature = "unwind_safe_lock_refs", since = "1.12.0")]
+#[stable(feature = "catch_unwind", since = "1.9.0")]
 impl<T: ?Sized> crate::panic::RefUnwindSafe for MutexGuard<'_, T> {}
 
 /// An RAII mutex guard returned by `MutexGuard::map`, which can point to a
@@ -324,7 +324,7 @@ pub struct MappedMutexGuard<
     #[rustc_assert_variance(covariant)] 'a,
     #[rustc_assert_variance(invariant)] T: ?Sized + 'a,
 > {
-    inner: Held<'a, plain::MappedMutexGuard<'a, T>>,
+    inner: lock::MappedMutexGuard<'a, poison::Flag, T>,
 }
 
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
@@ -346,7 +346,7 @@ impl<T> Mutex<T> {
     #[rustc_const_stable(feature = "const_locks", since = "1.63.0")]
     #[inline]
     pub const fn new(t: T) -> Mutex<T> {
-        Self { inner: Poison::new(plain::Mutex::new(t)) }
+        Mutex { inner: lock::Mutex::new(poison::Flag::new(), t) }
     }
 
     /// Returns the contained value by cloning it.
@@ -486,8 +486,7 @@ impl<T: ?Sized> Mutex<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        let guard = self.inner.lock.lock();
-        self.inner.flag.hold(guard, |inner| MutexGuard { inner })
+        self.inner.lock(|inner| MutexGuard { inner })
     }
 
     /// Attempts to acquire this lock.
@@ -533,8 +532,10 @@ impl<T: ?Sized> Mutex<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
-        let guard = self.inner.lock.try_lock().map_err(|_| TryLockError::WouldBlock)?;
-        self.inner.flag.hold(guard, |inner| MutexGuard { inner }).map_err(Into::into)
+        match self.inner.try_lock(|inner| MutexGuard { inner }) {
+            Some(result) => Ok(result?),
+            None => Err(TryLockError::WouldBlock),
+        }
     }
 
     /// Determines whether the mutex is poisoned.
@@ -561,7 +562,7 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     #[stable(feature = "sync_poison", since = "1.2.0")]
     pub fn is_poisoned(&self) -> bool {
-        self.inner.flag.get()
+        self.inner.poison.get()
     }
 
     /// Clear the poisoned state from a mutex.
@@ -599,7 +600,7 @@ impl<T: ?Sized> Mutex<T> {
     #[stable(feature = "mutex_unpoison", since = "1.77.0")]
     #[rustc_should_not_be_called_on_const_items]
     pub fn clear_poison(&self) {
-        self.inner.flag.clear();
+        self.inner.poison.clear();
     }
 
     /// Consumes this mutex, returning the underlying data.
@@ -623,7 +624,8 @@ impl<T: ?Sized> Mutex<T> {
     where
         T: Sized,
     {
-        self.inner.flag.check(self.inner.lock.into_inner())
+        let poison = self.inner.poison.borrow();
+        poison::map_result(poison, |()| self.inner.into_inner())
     }
 
     /// Returns a mutable reference to the underlying data.
@@ -652,7 +654,8 @@ impl<T: ?Sized> Mutex<T> {
     /// [`forget()`]: mem::forget
     #[stable(feature = "mutex_get_mut", since = "1.6.0")]
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
-        self.inner.flag.check(self.inner.lock.get_mut())
+        let poison = self.inner.poison.borrow();
+        poison::map_result(poison, |()| self.inner.get_mut())
     }
 
     /// Returns a raw pointer to the underlying data.
@@ -663,7 +666,7 @@ impl<T: ?Sized> Mutex<T> {
     /// or written through after the mutex is dropped.
     #[unstable(feature = "mutex_data_ptr", issue = "140368")]
     pub const fn data_ptr(&self) -> *mut T {
-        self.inner.lock.data_ptr()
+        self.inner.data_ptr()
     }
 }
 
@@ -699,7 +702,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
                 d.field("data", &"<locked>");
             }
         }
-        d.field("poisoned", &self.inner.flag.get());
+        d.field("poisoned", &self.inner.poison.get());
         d.finish_non_exhaustive()
     }
 }
@@ -709,14 +712,14 @@ impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.inner.guard
+        &self.inner
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner.guard
+        &mut self.inner
     }
 }
 
@@ -755,9 +758,7 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
         F: FnOnce(&mut T) -> &mut U,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig)
-            .transfer(|guard, watch| plain::MutexGuard::map(guard, |v| watch.project(|| f(v))));
-        MappedMutexGuard { inner }
+        MappedMutexGuard { inner: lock::MutexGuard::map(into_inner!(orig), f) }
     }
 
     /// Makes a [`MappedMutexGuard`] for a component of the borrowed data. The
@@ -775,10 +776,10 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
         F: FnOnce(&mut T) -> Option<&mut U>,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::MutexGuard::filter_map(guard, |v| watch.project(|| f(v)))
-        });
-        inner.transpose().map(|inner| MappedMutexGuard { inner }).map_err(|inner| Self { inner })
+        match lock::MutexGuard::filter_map(into_inner!(orig), f) {
+            Ok(inner) => Ok(MappedMutexGuard { inner }),
+            Err(inner) => Err(MutexGuard { inner }),
+        }
     }
 }
 
@@ -787,14 +788,14 @@ impl<T: ?Sized> Deref for MappedMutexGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.inner.guard
+        &self.inner
     }
 }
 
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
 impl<T: ?Sized> DerefMut for MappedMutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner.guard
+        &mut self.inner
     }
 }
 
@@ -833,10 +834,7 @@ impl<'a, T: ?Sized> MappedMutexGuard<'a, T> {
         F: FnOnce(&mut T) -> &mut U,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::MappedMutexGuard::map(guard, |v| watch.project(|| f(v)))
-        });
-        MappedMutexGuard { inner }
+        MappedMutexGuard { inner: lock::MappedMutexGuard::map(into_inner!(orig), f) }
     }
 
     /// Makes a [`MappedMutexGuard`] for a component of the borrowed data. The
@@ -854,9 +852,9 @@ impl<'a, T: ?Sized> MappedMutexGuard<'a, T> {
         F: FnOnce(&mut T) -> Option<&mut U>,
         U: ?Sized,
     {
-        let inner = into_guard_inner!(orig).transfer(|guard, watch| {
-            plain::MappedMutexGuard::filter_map(guard, |v| watch.project(|| f(v)))
-        });
-        inner.transpose().map(|inner| MappedMutexGuard { inner }).map_err(|inner| Self { inner })
+        match lock::MappedMutexGuard::filter_map(into_inner!(orig), f) {
+            Ok(inner) => Ok(MappedMutexGuard { inner }),
+            Err(inner) => Err(MappedMutexGuard { inner }),
+        }
     }
 }
